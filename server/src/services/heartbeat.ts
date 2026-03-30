@@ -2818,9 +2818,12 @@ export function heartbeatService(db: Db) {
             exitCode: adapterResult.exitCode,
           },
         });
-        await releaseIssueExecutionAndPromote(finalizedRun);
+        let quotaRetriedRun: typeof heartbeatRuns.$inferSelect | null = null;
         if (outcome === "failed" && adapterResult.errorCode === "gemini_quota_exhausted") {
-          await enqueueQuotaExhaustedRetry(finalizedRun, agent, new Date());
+          quotaRetriedRun = await enqueueQuotaExhaustedRetry(finalizedRun, agent, new Date());
+        }
+        if (!quotaRetriedRun) {
+          await releaseIssueExecutionAndPromote(finalizedRun);
         }
       }
 
@@ -3936,6 +3939,10 @@ export function heartbeatService(db: Db) {
     reapOrphanedRuns,
 
     resumeQueuedRuns,
+
+    enqueueQuotaExhaustedRetry,
+
+    startNextQueuedRunForAgent,
 
     tickTimers: async (now = new Date()) => {
       const allAgents = await db.select().from(agents);

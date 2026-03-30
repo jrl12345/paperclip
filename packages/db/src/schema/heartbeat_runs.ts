@@ -48,5 +48,6 @@ export const heartbeatRuns = pgTable(
       table.agentId,
       table.startedAt,
     ),
+    scheduledAtIdx: index("heartbeat_runs_scheduled_at_idx").on(table.scheduledAt),
   }),
 );

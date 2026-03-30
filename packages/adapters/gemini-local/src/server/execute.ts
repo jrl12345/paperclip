@@ -392,7 +392,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         signal: attempt.proc.signal,
         timedOut: true,
         errorMessage: `Timed out after ${timeoutSec}s`,
-        errorCode: authMeta.requiresAuth ? "gemini_auth_required" : null,
+        errorCode: authMeta.requiresAuth ? "gemini_auth_required" : quotaMeta.exhausted ? "gemini_quota_exhausted" : null,
         clearSession: clearSessionOnMissingSession,
       };
     }
