@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
-import { and, asc, desc, eq, gt, inArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNull, lte, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import type { BillingType, ExecutionWorkspaceConfig } from "@paperclipai/shared";
 import {
@@ -1663,6 +1663,128 @@ export function heartbeatService(db: Db) {
     return queued;
   }
 
+  const QUOTA_RETRY_BASE_DELAY_SEC = 60;
+  const QUOTA_RETRY_MAX_DELAY_SEC = 600;
+  const QUOTA_RETRY_MAX_ATTEMPTS = 5;
+
+  async function enqueueQuotaExhaustedRetry(
+    run: typeof heartbeatRuns.$inferSelect,
+    agent: typeof agents.$inferSelect,
+    now: Date,
+  ) {
+    const contextSnapshot = parseObject(run.contextSnapshot);
+    const quotaRetryCount = asNumber(contextSnapshot.quotaRetryCount, 0);
+    if (quotaRetryCount >= QUOTA_RETRY_MAX_ATTEMPTS) return null;
+
+    const issueId = readNonEmptyString(contextSnapshot.issueId);
+    const taskKey = deriveTaskKey(contextSnapshot, null);
+    const sessionBefore = await resolveSessionBeforeForWakeup(agent, taskKey);
+
+    // Exponential backoff with ±20% jitter, capped at max delay
+    const baseDelaySec = Math.min(
+      QUOTA_RETRY_BASE_DELAY_SEC * Math.pow(2, quotaRetryCount),
+      QUOTA_RETRY_MAX_DELAY_SEC,
+    );
+    const jitterFraction = 0.2 * (Math.random() * 2 - 1);
+    const delaySec = Math.round(baseDelaySec * (1 + jitterFraction));
+    const scheduledAt = new Date(now.getTime() + delaySec * 1000);
+
+    const retryContextSnapshot = {
+      ...contextSnapshot,
+      retryOfRunId: run.id,
+      wakeReason: "quota_exhausted_retry",
+      retryReason: "quota_exhausted",
+      quotaRetryCount: quotaRetryCount + 1,
+    };
+
+    const queued = await db.transaction(async (tx) => {
+      const wakeupRequest = await tx
+        .insert(agentWakeupRequests)
+        .values({
+          companyId: run.companyId,
+          agentId: run.agentId,
+          source: "automation",
+          triggerDetail: "system",
+          reason: "quota_exhausted_retry",
+          payload: {
+            ...(issueId ? { issueId } : {}),
+            retryOfRunId: run.id,
+            scheduledAt: scheduledAt.toISOString(),
+          },
+          status: "queued",
+          requestedByActorType: "system",
+          requestedByActorId: null,
+          updatedAt: now,
+        })
+        .returning()
+        .then((rows) => rows[0]);
+
+      const retryRun = await tx
+        .insert(heartbeatRuns)
+        .values({
+          companyId: run.companyId,
+          agentId: run.agentId,
+          invocationSource: "automation",
+          triggerDetail: "system",
+          status: "queued",
+          wakeupRequestId: wakeupRequest.id,
+          contextSnapshot: retryContextSnapshot,
+          sessionIdBefore: sessionBefore,
+          retryOfRunId: run.id,
+          scheduledAt,
+          updatedAt: now,
+        })
+        .returning()
+        .then((rows) => rows[0]);
+
+      await tx
+        .update(agentWakeupRequests)
+        .set({ runId: retryRun.id, updatedAt: now })
+        .where(eq(agentWakeupRequests.id, wakeupRequest.id));
+
+      if (issueId) {
+        await tx
+          .update(issues)
+          .set({
+            executionRunId: retryRun.id,
+            executionAgentNameKey: normalizeAgentNameKey(agent.name),
+            executionLockedAt: now,
+            updatedAt: now,
+          })
+          .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId), eq(issues.executionRunId, run.id)));
+      }
+
+      return retryRun;
+    });
+
+    publishLiveEvent({
+      companyId: queued.companyId,
+      type: "heartbeat.run.queued",
+      payload: {
+        runId: queued.id,
+        agentId: queued.agentId,
+        invocationSource: queued.invocationSource,
+        triggerDetail: queued.triggerDetail,
+        wakeupRequestId: queued.wakeupRequestId,
+      },
+    });
+
+    await appendRunEvent(queued, 1, {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "warn",
+      message: `Queued delayed retry after quota exhaustion (attempt ${quotaRetryCount + 1}/${QUOTA_RETRY_MAX_ATTEMPTS}, delay ${delaySec}s)`,
+      payload: {
+        retryOfRunId: run.id,
+        scheduledAt: scheduledAt.toISOString(),
+        delaySec,
+        quotaRetryCount: quotaRetryCount + 1,
+      },
+    });
+
+    return queued;
+  }
+
   function parseHeartbeatPolicy(agent: typeof agents.$inferSelect) {
     const runtimeConfig = parseObject(agent.runtimeConfig);
     const heartbeat = parseObject(runtimeConfig.heartbeat);
@@ -1885,10 +2007,14 @@ export function heartbeatService(db: Db) {
   }
 
   async function resumeQueuedRuns() {
+    const now = new Date();
     const queuedRuns = await db
       .select({ agentId: heartbeatRuns.agentId })
       .from(heartbeatRuns)
-      .where(eq(heartbeatRuns.status, "queued"));
+      .where(and(
+        eq(heartbeatRuns.status, "queued"),
+        or(isNull(heartbeatRuns.scheduledAt), lte(heartbeatRuns.scheduledAt, now)),
+      ));
 
     const agentIds = [...new Set(queuedRuns.map((r) => r.agentId))];
     for (const agentId of agentIds) {
@@ -1963,10 +2089,15 @@ export function heartbeatService(db: Db) {
       const availableSlots = Math.max(0, policy.maxConcurrentRuns - runningCount);
       if (availableSlots <= 0) return [];
 
+      const now = new Date();
       const queuedRuns = await db
         .select()
         .from(heartbeatRuns)
-        .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "queued")))
+        .where(and(
+          eq(heartbeatRuns.agentId, agentId),
+          eq(heartbeatRuns.status, "queued"),
+          or(isNull(heartbeatRuns.scheduledAt), lte(heartbeatRuns.scheduledAt, now)),
+        ))
         .orderBy(asc(heartbeatRuns.createdAt))
         .limit(availableSlots);
       if (queuedRuns.length === 0) return [];
@@ -2751,7 +2882,13 @@ export function heartbeatService(db: Db) {
             exitCode: adapterResult.exitCode,
           },
         });
-        await releaseIssueExecutionAndPromote(finalizedRun);
+        let quotaRetriedRun: typeof heartbeatRuns.$inferSelect | null = null;
+        if (outcome === "failed" && adapterResult.errorCode === "gemini_quota_exhausted") {
+          quotaRetriedRun = await enqueueQuotaExhaustedRetry(finalizedRun, agent, new Date());
+        }
+        if (!quotaRetriedRun) {
+          await releaseIssueExecutionAndPromote(finalizedRun);
+        }
       }
 
       if (finalizedRun) {
@@ -3866,6 +4003,10 @@ export function heartbeatService(db: Db) {
     reapOrphanedRuns,
 
     resumeQueuedRuns,
+
+    enqueueQuotaExhaustedRetry,
+
+    startNextQueuedRunForAgent,
 
     tickTimers: async (now = new Date()) => {
       const allAgents = await db.select().from(agents);
